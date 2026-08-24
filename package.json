@@ -1,0 +1,53 @@
+{
+  "name": "sidor-character",
+  "version": "0.2.0",
+  "description": "SIDOR 人设卡 —— DeepSeek Harness 独立附属插件：批量导入人设卡（.persona.md / 酒馆角色卡），自由选择加载/更换人设，应用于 agent 与用户交流风格（会话内即时应用 + Agent 预设持久化）。与主皮肤 sidor-ui、工具箱 sidor-box 互相独立，官方插槽接入，可无冲突共存。",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "plugin",
+    "sidor",
+    "sidor-character",
+    "persona",
+    "persona-card",
+    "character-card",
+    "agent-presets",
+    "agent preset",
+    "ui",
+    "web"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-connection"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "preview",
+    "docs",
+    "README.md"
+  ],
+  "scripts": {
+    "build:client": "powershell -ExecutionPolicy Bypass -File scripts/build-client.ps1"
+  },
+  "license": "MIT"
+}

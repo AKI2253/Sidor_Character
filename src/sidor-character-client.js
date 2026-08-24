@@ -1,0 +1,1598 @@
+/* ==========================================================================
+ * Sidor_Character — 人设卡（Persona Card）· 客户端源码
+ *
+ * 本文件是「动态 ↔ 静态」双形态共用的插件函数体（单一事实源）：
+ *
+ * · 动态形态：作为 cordis_define 的 code.client 运行。动态 runner
+ *   （dsh-cordis-client-runner）用
+ *   new Function(React, console, styles, host, harness, ..., process, Buffer)
+ *   求值本函数体，闭包注入面与本仓库 scripts/client-wrapper.template.js
+ *   完全一致——同一份源码无需改动即可在两种形态下运行。
+ * · 静态形态：由 scripts/build-client.ps1 把本文件内联进
+ *   scripts/client-wrapper.template.js，生成 lib/client.js（ModuleLoader
+ *   bundle），经 scripts/install.ps1 装入 profile 后随 DSH 启动自动加载。
+ *
+ * 双形态红线（保证「后续功能转为静态插件都能使用」）：
+ *   - 无顶层 import / export / TS / JSX；React 一律 React.createElement；
+ *   - host.call(...) 必须 try/catch —— 静态形态的 host 会直接 reject，
+ *     catch 分支即「静态形态：由 agent 代执行」降级路径；
+ *   - 持久化只走浏览器 localStorage（动态/静态共用同源存储，键见 docs）；
+ *   - 定时器 / observer 一律 ctx.timeout / ctx.interval / ctx.effect 管理，
+ *     依赖声明 inject: ['timer'] 由 build 脚本提升到 bundle 顶层导出；
+ *   - 颜色只用 --dsw-alias-* / --dsw-specific-* 主题变量，不写死色值。
+ *
+ * 功能（v1+v2，见 docs/PERSONA_DESIGN.md）：
+ *   - 批量导入人设卡（.persona.md 主格式；酒馆 JSON / pack JSON 兼容）；
+ *   - 人设卡列表：应用 / 停用 / 安装预设 / 卸载预设 / 删除；
+ *   - 通道 A：会话内即时应用（官方 /api session.prompt，双形态通用）；
+ *   - 通道 B：预设化持久（动态形态 host 半直连 agentPresets 服务；
+ *     静态形态自动降级为 agent 代执行）。
+ * ========================================================================== */
+
+return {
+  inject: ['timer'],
+  apply(ctx) {
+    const slots = ctx.get('slots')
+    if (slots === undefined) return
+
+    /* ============ 人设卡图标 ============ */
+    // 风格与官方图标一致：16 viewBox、stroke=currentColor、stroke-width 1.3。
+    const ICON_CHARA =
+      '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+      '<rect x="1.9" y="2.7" width="12.2" height="10.6" rx="1.4" stroke="currentColor" stroke-width="1.3"/>' +
+      '<circle cx="6.2" cy="6.4" r="1.5" stroke="currentColor" stroke-width="1.3"/>' +
+      '<path d="M4.1 10.3a2.1 2.1 0 0 1 4.2 0" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+      '<path d="M9.9 5.7h2.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+      '<path d="M9.9 8.2h2.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+      '<path d="M9.9 10.7h1.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+      '</svg>'
+
+    /* ============ 导入图标（托盘 + 下箭头） ============ */
+    const ICON_IMPORT =
+      '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+      '<path d="M8 2.4 V9.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+      '<path d="M5.6 6.9 8 9.3 10.4 6.9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>' +
+      '<path d="M2.8 9.6 V12.4 H13.2 V9.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>' +
+      '</svg>'
+
+    /* ============ 信息图标（格式说明） ============ */
+    const ICON_INFO =
+      '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">' +
+      '<circle cx="8" cy="8" r="5.6" stroke="currentColor" stroke-width="1.3"/>' +
+      '<path d="M8 7.1 V10.9" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+      '<path d="M8 4.9 V5.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>' +
+      '</svg>'
+
+    /* ============ 格式模板与转换提示词常量 ============ */
+    const SIDCHARA_FMT_MD = [
+      '---',
+      'format: sidor-persona',
+      'version: 1',
+      'id: my-persona',
+      'name: 我的新角色',
+      'description: 一句话简介',
+      'tags: [标签1, 标签2]',
+      'apply: preset',
+      '---',
+      '你是「我的新角色」。与用户交流时：',
+      '',
+      '- 语气……',
+      '- 说话方式……',
+      '- 行为规则……',
+    ].join('\n')
+    const SIDCHARA_FMT_AI = [
+      '请把以下角色/人设内容整理成 Sidor 人设卡（.persona.md）格式，并输出完整文件内容：',
+      '',
+      '格式要求：',
+      '1. 文件开头用 --- 包裹 YAML front matter：',
+      '   format: sidor-persona',
+      '   version: 1',
+      '   id: 小写字母/数字/中划线（如 my-persona）',
+      '   name: 人设名称',
+      '   description: 一句话简介',
+      '   tags: [标签1, 标签2]',
+      '   style: friendly（可选：formal / friendly / playful / terse）',
+      '   apply: preset（可选：preset=安装为预设 / session=仅当前会话）',
+      '2. front matter 之后是人设正文（Markdown），写给 Agent 的指令：',
+      '   - 明确身份与角色：「你是……」；',
+      '   - 说话语气、用词习惯与回答风格（用「你应/请……」等第二人称指令句）；',
+      '   - 知识边界与行为规则；',
+      '   - 内容简洁具体，避免空泛形容词。',
+      '3. 只输出 .persona.md 文件内容，不要额外解释。',
+      '',
+      '原始内容：',
+      '<粘贴你的角色描述、对话示例或旧版人设卡>',
+    ].join('\n')
+    const SIDCHARA_FMT_PACK = [
+      '{',
+      '  "format": "sidor-persona-pack",',
+      '  "version": 1,',
+      '  "personas": [',
+      '    {',
+      '      "frontmatter": { "id": "scholar-senpai", "name": "知性学姐", "description": "博学温柔的学姐" },',
+      '      "body": "你是「知性学姐」。与用户交流时：\\n- 语气温和耐心\\n- 先给结论再用例子展开"',
+      '    },',
+      '    {',
+      '      "frontmatter": { "id": "cool-teen", "name": "冷面少年", "description": "话少但靠谱" },',
+      '      "body": "你是「冷面少年」。与用户交流时：\\n- 简短直接\\n- 不闲聊，只回答有用的"',
+      '    }',
+      '  ]',
+      '}',
+    ].join('\n')
+    const SIDCHARA_FMT_TAVERN = [
+      '{',
+      '  "name": "知性学姐",',
+      '  "description": "博学温柔的学姐，用浅显的方式讲解知识",',
+      '  "personality": "温和、耐心、喜欢用生活化的例子",',
+      '  "scenario": "在图书馆自习室与你相遇",',
+      '  "first_mes": "你好呀，又见面了~",',
+      '  "mes_example": "<START>\\n{{user}}: 这道题我不太懂\\n{{char}}: 我们一起来看~"',
+      '}',
+    ].join('\n')
+
+    /* ============ 当前会话捕获（conversation.input.dock props 携带 sessionId） ============ */
+    let sidCharaSessionId = null
+    function SidCharaDockWatcher(props) {
+      if (props && props.sessionId) sidCharaSessionId = props.sessionId
+      return null
+    }
+
+    /* ============ 官方 /api RPC（同源 fetch，双形态通用） ============ */
+    async function sidCharaHostRpc(method, payload) {
+      const rpcId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+        ? crypto.randomUUID()
+        : 'sid-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)
+      const w = typeof window !== 'undefined' ? window : null
+      if (!w) throw new Error('no window')
+      const res = await w.fetch('/api/' + method, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'client-request', rpcId: rpcId, method: method, payload: payload || {} }),
+      })
+      if (!res.ok) throw new Error('host ' + method + ' HTTP ' + res.status)
+      const json = await res.json()
+      if (!json || json.type !== 'server-response' || json.rpcId !== rpcId) throw new Error('host ' + method + ' 响应无效')
+      const result = json.result
+      if (!result || !result.ok) {
+        const err = result && result.error
+        const msg = err && typeof err.message === 'string' ? err.message : (err ? JSON.stringify(err) : '请求失败')
+        throw new Error(msg)
+      }
+      return result.value
+    }
+
+    /* 会话内指令（通道 A 与静态形态 agent 代执行共用） */
+    async function sidCharaPromptAgent(text) {
+      if (!sidCharaSessionId) throw new Error('未检测到当前会话：请先打开一个会话，再执行该操作')
+      await sidCharaHostRpc('session.prompt', {
+        sessionId: sidCharaSessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: text }],
+      })
+    }
+
+    /* 宿主 RPC（动态形态走 host.call；静态形态一律 reject → 返回 null 走降级） */
+    async function sidCharaHostCall(method, args) {
+      try {
+        return await host.call(method, args || {})
+      } catch (e) {
+        return null
+      }
+    }
+
+    /* ============ 注册表 store（localStorage 'sidor.character.prefs'） ============ */
+    let sidChara = {
+      personas: {},       // id → { id, name, description, tags[], style, apply, source, body, installed }
+      currentId: null,    // 通道 A 当前生效的人设 id（会话内）
+      enabled: true,
+      busy: false,
+      toast: '',
+      toastSeq: 0,
+      preview: null,      // { cards: [{card, action, newId}], errors: [] }
+      formatOpen: false,  // 格式说明与模板弹窗
+    }
+    try {
+      const raw = window.localStorage.getItem('sidor.character.prefs')
+      if (raw) {
+        const o = JSON.parse(raw)
+        if (o && typeof o === 'object') {
+          if (o.personas && typeof o.personas === 'object') sidChara.personas = o.personas
+          if (typeof o.currentId === 'string') sidChara.currentId = o.currentId
+          if (typeof o.enabled === 'boolean') sidChara.enabled = o.enabled
+        }
+      }
+    } catch (e) { /* ignore */ }
+    const sidCharaListeners = new Set()
+    function sidCharaNotify() { for (const fn of Array.from(sidCharaListeners)) { try { fn() } catch (e) { /* ignore */ } } }
+    function sidCharaSubscribe(fn) { sidCharaListeners.add(fn); return () => sidCharaListeners.delete(fn) }
+    function sidCharaSave() {
+      try {
+        window.localStorage.setItem('sidor.character.prefs', JSON.stringify({
+          personas: sidChara.personas,
+          currentId: sidChara.currentId,
+          enabled: sidChara.enabled,
+        }))
+      } catch (e) { /* ignore */ }
+    }
+    function sidCharaToast(text) { sidChara.toast = text; sidChara.toastSeq++; sidCharaNotify() }
+    function sidCharaToastClear() { if (sidChara.toast === '') return; sidChara.toast = ''; sidChara.toastSeq++; sidCharaNotify() }
+
+    /* ============ 格式说明弹窗 + 剪贴板 ============ */
+    function sidCharaFormatOpen() { sidChara.formatOpen = true; sidCharaNotify() }
+    function sidCharaFormatClose() { sidChara.formatOpen = false; sidCharaNotify() }
+    function sidCharaCopyText(text) {
+      const w = typeof window !== 'undefined' ? window : null
+      const done = () => sidCharaToast('已复制到剪贴板')
+      const fallback = () => {
+        try {
+          const ta = w.document.createElement('textarea')
+          ta.value = text
+          ta.style.position = 'fixed'
+          ta.style.opacity = '0'
+          w.document.body.appendChild(ta)
+          ta.select()
+          w.document.execCommand('copy')
+          ta.remove()
+          done()
+        } catch (e) {
+          sidCharaToast('复制失败，请手动选择复制')
+        }
+      }
+      try {
+        if (w && w.navigator && w.navigator.clipboard && w.navigator.clipboard.writeText) {
+          w.navigator.clipboard.writeText(text).then(done, fallback)
+          return
+        }
+      } catch (e) { /* ignore */ }
+      fallback()
+    }
+
+    /* ============ 人设卡解析器（极简 YAML front matter，无第三方依赖） ============ */
+    function sidCharaParseFrontMatter(text) {
+      const m = String(text).match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
+      if (!m) return null
+      const fm = {}
+      for (const rawLine of m[1].split(/\r?\n/)) {
+        const t = rawLine.trim()
+        if (!t || t.charAt(0) === '#') continue
+        const idx = t.indexOf(':')
+        if (idx <= 0) continue
+        const key = t.slice(0, idx).trim()
+        let val = t.slice(idx + 1).trim()
+        if (val.charAt(0) === '[' && val.charAt(val.length - 1) === ']') {
+          val = val.slice(1, -1).split(',').map((s) => s.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean)
+        } else {
+          val = val.replace(/\s+#.*$/, '').replace(/^['"]|['"]$/g, '')
+          if (val === 'true') val = true
+          else if (val === 'false') val = false
+          else if (/^-?\d+(\.\d+)?$/.test(val)) val = Number(val)
+        }
+        fm[key] = val
+      }
+      return { fm: fm, body: (m[2] || '').replace(/^\s+|\s+$/g, '') }
+    }
+
+    function sidCharaValidate(card) {
+      const errors = []
+      if (!card.id || !/^[a-z0-9][a-z0-9-]*$/.test(card.id)) errors.push('id 缺失或非法（须小写字母/数字/中划线）：' + (card.id || ''))
+      if (!card.name) errors.push('name 缺失')
+      if (!card.body || !card.body.trim()) errors.push('人设正文为空')
+      return errors
+    }
+
+    function sidCharaCardFromMd(text, fileName) {
+      const p = sidCharaParseFrontMatter(text)
+      if (!p) return null
+      const fm = p.fm || {}
+      const card = {
+        id: String(fm.id || ''),
+        name: String(fm.name || fileName || '未命名'),
+        description: String(fm.description || ''),
+        tags: Array.isArray(fm.tags) ? fm.tags.map(String) : [],
+        style: String(fm.style || ''),
+        apply: String(fm.apply || 'preset'),
+        author: String(fm.author || ''),
+        source: 'persona-md',
+        body: p.body,
+      }
+      return card
+    }
+
+    function sidCharaCardFromTavern(obj) {
+      const name = String(obj && (obj.name || obj.char_name) || '未命名')
+      const desc = String(obj && (obj.description || obj.char_persona || '') || '')
+      const parts = [
+        '你是「' + name + '」。',
+        desc ? '角色设定：' + desc : '',
+        obj && obj.personality ? '性格：' + String(obj.personality) : '',
+        obj && obj.scenario ? '场景：' + String(obj.scenario) : '',
+        obj && obj.first_mes ? '开场白：' + String(obj.first_mes) : '',
+        obj && obj.mes_example ? '对话示例：\n' + String(obj.mes_example) : '',
+      ].filter(Boolean).join('\n\n')
+      const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'card'
+      return {
+        id: 'tavern-' + base + '-' + Math.random().toString(36).slice(2, 6),
+        name: name,
+        description: desc.slice(0, 80),
+        tags: ['酒馆'],
+        style: '',
+        apply: 'preset',
+        author: '',
+        source: 'tavern',
+        body: parts,
+      }
+    }
+
+    async function sidCharaParseFile(file) {
+      const name = String(file && file.name || '')
+      const text = await new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result || ''))
+        reader.onerror = () => reject(new Error('读取文件失败：' + name))
+        reader.readAsText(file)
+      })
+      if (/\.json$/i.test(name)) {
+        let obj = null
+        try { obj = JSON.parse(text) } catch (e) { return { ok: false, name: name, errors: ['JSON 解析失败'] } }
+        if (obj && obj.format === 'sidor-persona-pack' && Array.isArray(obj.personas)) {
+          const cards = []
+          for (const it of obj.personas) {
+            const fm = (it && it.frontmatter) || {}
+            cards.push({
+              id: String(fm.id || ''),
+              name: String(fm.name || '未命名'),
+              description: String(fm.description || ''),
+              tags: Array.isArray(fm.tags) ? fm.tags.map(String) : [],
+              style: String(fm.style || ''),
+              apply: String(fm.apply || 'preset'),
+              author: String(fm.author || ''),
+              source: 'pack',
+              body: String((it && it.body) || ''),
+            })
+          }
+          return { ok: true, name: name, cards: cards }
+        }
+        return { ok: true, name: name, cards: [sidCharaCardFromTavern(obj)] }
+      }
+      const card = sidCharaCardFromMd(text, name.replace(/\.persona\.md$/i, '').replace(/\.md$/i, ''))
+      if (!card) return { ok: false, name: name, errors: ['不是合法的人设卡文件（缺少 --- front matter --- 结构）'] }
+      const errors = sidCharaValidate(card)
+      if (errors.length) return { ok: false, name: name, errors: errors }
+      return { ok: true, name: name, cards: [card] }
+    }
+
+    /* ============ 批量导入（多选 / 拖拽） ============ */
+    async function sidCharaReadFiles(fileList) {
+      const files = Array.from(fileList || [])
+      if (files.length === 0) return
+      sidChara.busy = true
+      sidCharaNotify()
+      const results = []
+      for (const f of files) {
+        try {
+          results.push(await sidCharaParseFile(f))
+        } catch (e) {
+          results.push({ ok: false, name: String(f.name || '文件'), errors: [String((e && e.message) || e)] })
+        }
+      }
+      const cards = []
+      const errors = []
+      for (const r of results) {
+        if (r.ok && r.cards && r.cards.length) cards.push.apply(cards, r.cards)
+        else if (r.errors && r.errors.length) errors.push({ name: r.name || '文件', errors: r.errors })
+      }
+      sidChara.busy = false
+      if (cards.length === 0) {
+        if (errors.length) sidCharaToast('导入失败：' + errors[0].name + ' — ' + errors[0].errors[0])
+        else sidCharaToast('未解析到任何人设卡')
+        sidCharaNotify()
+        return
+      }
+      sidChara.preview = {
+        cards: cards.map((c) => ({
+          card: c,
+          action: sidChara.personas[c.id] ? 'skip' : 'new',
+          newId: '',
+        })),
+        errors: errors,
+      }
+      sidCharaNotify()
+    }
+
+    function sidCharaPreviewSetAction(idx, action) {
+      const pv = sidChara.preview
+      if (!pv || !pv.cards[idx]) return
+      pv.cards[idx].action = action
+      sidCharaNotify()
+    }
+
+    function sidCharaPreviewRename(idx, newId) {
+      const pv = sidChara.preview
+      if (!pv || !pv.cards[idx]) return
+      pv.cards[idx].newId = newId
+      sidCharaNotify()
+    }
+
+    function sidCharaConfirmImport() {
+      const pv = sidChara.preview
+      if (!pv) return
+      let added = 0, updated = 0, skipped = 0, renamed = 0
+      for (const row of pv.cards) {
+        const c = row.card
+        if (row.action === 'skip') { skipped++; continue }
+        let id = c.id
+        if (row.action === 'rename') {
+          id = (row.newId || '').trim()
+          if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) { sidCharaToast('重命名 id 不合法：' + id + '（须小写字母/数字/中划线）'); return }
+          if (sidChara.personas[id] && id !== c.id) { sidCharaToast('重命名后的 id 已存在：' + id + '（请换一个或选择覆盖）'); return }
+          c.id = id
+          renamed++
+        }
+        const existed = !!sidChara.personas[id]
+        sidChara.personas[id] = c
+        if (existed) updated++; else added++
+      }
+      sidChara.preview = null
+      sidCharaSave()
+      sidCharaNotify()
+      sidCharaToast('导入完成：新增 ' + added + '，更新 ' + updated + '，跳过 ' + skipped + (renamed ? '，重命名 ' + renamed : ''))
+    }
+
+    function sidCharaCancelImport() {
+      sidChara.preview = null
+      sidCharaNotify()
+    }
+
+    /* ============ 通道 A：会话内即时应用 ============ */
+    async function sidCharaApplySession(id) {
+      const card = sidChara.personas[id]
+      if (!card) return
+      sidChara.busy = true
+      sidCharaNotify()
+      try {
+        await sidCharaPromptAgent(
+          '【SIDOR 人设卡】从现在起，请以以下人设与用户交流，直到被要求更换或恢复默认：\n' +
+          '人设名称：' + card.name + '\n\n' +
+          '人设要求：\n' + card.body
+        )
+        sidChara.currentId = id
+        sidCharaSave()
+        sidCharaToast('已应用到当前会话：' + card.name)
+      } catch (e) {
+        sidCharaToast((e && e.message) ? e.message : String(e))
+      } finally {
+        sidChara.busy = false
+        sidCharaNotify()
+      }
+    }
+
+    async function sidCharaDisable() {
+      sidChara.busy = true
+      sidCharaNotify()
+      try {
+        await sidCharaPromptAgent('【SIDOR 人设卡】请恢复默认的交流风格，不再使用之前应用的人设卡。')
+        sidChara.currentId = null
+        sidCharaSave()
+        sidCharaToast('已恢复默认交流风格')
+      } catch (e) {
+        sidCharaToast((e && e.message) ? e.message : String(e))
+      } finally {
+        sidChara.busy = false
+        sidCharaNotify()
+      }
+    }
+
+    /* ============ 通道 B：预设化持久（动态 host 半 RPC；静态降级 agent 代执行） ============ */
+    function sidCharaPresetInstruction(card, remove, others) {
+      const dir = '$env:USERPROFILE\\.dsh\\.agent-presets\\' + card.id
+      if (remove) {
+        return '【SIDOR 人设卡】请卸载 agent 预设 ' + card.id + '：删除目录 ' + dir +
+          '（先确认其中无用户自改内容；删除 %USERPROFILE% 下文件需要授权时请申请）。完成后汇报。'
+      }
+      const lines = [
+        '【SIDOR 人设卡】请把以下人设安装为 DSH 的用户 agent 预设。',
+        '预设 id：' + card.id,
+        '预设名称：SIDOR 人设 · ' + card.name,
+        '预设简介：' + (card.description || ''),
+        '执行步骤：',
+        '1) 定位 DSH 的 standard 预设：含 @deepseek-ai/dsh-persona 行的 agent.cordis.yml（通常在 DSH 安装目录 apps/cli/config/agent-presets/standard/，找不到就全局搜索该文件）；',
+        '2) 在 ' + dir + ' 准备用户预设目录：若目录已存在（可能来自上一次未完成的安装），跳过复制直接编辑；否则把 standard 的 agent.cordis.yml 与 preset.yml 复制进去；',
+        '3) 编辑 agent.cordis.yml：保留 id 为 persona 的那一行（@deepseek-ai/dsh-persona）原有 config.text 基底文本，在其后追加【人设卡】内容，注意 YAML 缩进（正文每行缩进 6 个空格）与换行；',
+        '4) 编辑 preset.yml：name 写「SIDOR 人设 · ' + card.name + '」，description 写人设简介（注意 YAML 引号转义）；',
+        '5) 完成后汇报；写入 %USERPROFILE%\\.dsh 需要授权时请申请。',
+        '',
+        '【人设卡正文】',
+        card.body,
+      ]
+      if (others && others.length) {
+        lines.push('', '【同时卸载旧预设（同一时间只保留一个人设预设生效）】请删除以下旧的用户 agent 预设目录（如存在）：')
+        for (const o of others) {
+          lines.push('- ' + o.id + '（' + o.name + '）：删除 $env:USERPROFILE\\.dsh\\.agent-presets\\' + o.id)
+        }
+      }
+      return lines.join('\n')
+    }
+
+    async function sidCharaInstallPreset(id) {
+      const card = sidChara.personas[id]
+      if (!card) return
+      // 单预设制：安装新人设时，先找出其他已装预设（同一时间只保留一个人设预设生效）
+      const others = Object.keys(sidChara.personas)
+        .filter((k) => k !== id && sidChara.personas[k] && sidChara.personas[k].installed)
+        .map((k) => sidChara.personas[k])
+      sidChara.busy = true
+      sidCharaNotify()
+      const res = await sidCharaHostCall('sidor-chara/preset-install', {
+        id: card.id,
+        name: card.name,
+        description: card.description || '',
+        body: card.body,
+      })
+      if (res && res.ok) {
+        // 动态形态：安装成功后，逐个卸载其他已装预设
+        const failed = []
+        for (const o of others) {
+          const r = await sidCharaHostCall('sidor-chara/preset-remove', { id: o.id })
+          if (r && r.ok) o.installed = false
+          else failed.push(o.name)
+        }
+        card.installed = true
+        sidCharaSave()
+        sidCharaToast('已安装为 Agent 预设「SIDOR 人设 · ' + card.name + '」，可在新建会话时选择' + (failed.length ? '（旧预设 ' + failed.join('、') + ' 卸载失败，请稍后手动卸载）' : ''))
+      } else {
+        try {
+          await sidCharaPromptAgent(sidCharaPresetInstruction(card, false, others))
+          card.installed = true
+          for (const o of others) o.installed = false
+          sidCharaSave()
+          sidCharaToast('已委托 agent 安装预设并替换旧预设（静态形态），完成后可在新建会话时选择')
+        } catch (e) {
+          sidCharaToast((e && e.message) ? e.message : String(e))
+        }
+      }
+      sidChara.busy = false
+      sidCharaNotify()
+    }
+
+    async function sidCharaRemovePreset(id) {
+      const card = sidChara.personas[id]
+      if (!card) return
+      sidChara.busy = true
+      sidCharaNotify()
+      const res = await sidCharaHostCall('sidor-chara/preset-remove', { id: card.id })
+      if (res && res.ok) {
+        card.installed = false
+        sidCharaSave()
+        sidCharaToast('已卸载 Agent 预设：' + card.id)
+      } else {
+        try {
+          await sidCharaPromptAgent(sidCharaPresetInstruction(card, true))
+          card.installed = false
+          sidCharaSave()
+          sidCharaToast('已委托 agent 卸载预设（静态形态）')
+        } catch (e) {
+          sidCharaToast((e && e.message) ? e.message : String(e))
+        }
+      }
+      sidChara.busy = false
+      sidCharaNotify()
+    }
+
+    async function sidCharaRefreshInstalled() {
+      const res = await sidCharaHostCall('sidor-chara/preset-list', {})
+      if (!res || !res.ok || !Array.isArray(res.presets)) return
+      const ids = {}
+      for (const p of res.presets) ids[p.id] = true
+      let changed = false
+      for (const key of Object.keys(sidChara.personas)) {
+        const c = sidChara.personas[key]
+        const inst = !!ids[c.id]
+        if (c.installed !== inst) { c.installed = inst; changed = true }
+      }
+      if (changed) { sidCharaSave(); sidCharaNotify() }
+    }
+
+    function sidCharaDeleteCard(id) {
+      const card = sidChara.personas[id]
+      if (!card) return
+      if (card.installed) { sidCharaToast('请先「卸载预设」再删除该人设卡'); return }
+      delete sidChara.personas[id]
+      if (sidChara.currentId === id) sidChara.currentId = null
+      sidCharaSave()
+      sidCharaNotify()
+      sidCharaToast('已删除人设卡：' + card.name)
+    }
+
+    /* ============ 组件：格式说明与模板弹窗（分 tab 详细教程） ============ */
+    function CharaFormatDialog() {
+      const [st, setSt] = React.useState({ open: sidChara.formatOpen, tab: 'md' })
+      React.useEffect(() => sidCharaSubscribe(() => setSt({ open: sidChara.formatOpen, tab: st.tab })), [])
+      React.useEffect(() => {
+        if (!st.open) return
+        const onKey = (e) => { if (e.key === 'Escape') sidCharaFormatClose() }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [st.open])
+      if (!st.open) return null
+      const copyBtn = (label, text) => React.createElement('button', {
+        type: 'button',
+        className: 'sid-chara-card-btn sid-chara-copy-btn',
+        onClick: () => sidCharaCopyText(text),
+      }, '复制' + label)
+      const setTab = (t) => setSt({ open: sidChara.formatOpen, tab: t })
+      const tabBtn = (id, label) => React.createElement('button', {
+        type: 'button',
+        className: 'sid-chara-format-tab' + (st.tab === id ? ' active' : ''),
+        onClick: () => setTab(id),
+        'aria-selected': st.tab === id,
+        role: 'tab',
+      }, label)
+      const steps = (items) => React.createElement('ol', { className: 'sid-chara-format-steps' },
+        items.map((it, i) => React.createElement('li', { key: 's' + i }, it)))
+      let body = null
+      if (st.tab === 'md') {
+        body = React.createElement(React.Fragment, null,
+          React.createElement('p', { className: 'sid-chara-format-note' },
+            '主格式：一张卡 = 一个 .persona.md 文件。开头用 --- 包裹 YAML 元信息，下方正文即人设指令（Agent 会直接遵循）。'),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-title' }, '字段说明'),
+            React.createElement('ul', { className: 'sid-chara-format-fields' },
+              React.createElement('li', null, React.createElement('b', null, 'format / version'), ' — 必填，固定为 sidor-persona / 1'),
+              React.createElement('li', null, React.createElement('b', null, 'id'), ' — 必填，唯一标识（小写字母 / 数字 / 中划线），也是安装预设时的目录名'),
+              React.createElement('li', null, React.createElement('b', null, 'name'), ' — 必填，显示名称'),
+              React.createElement('li', null, React.createElement('b', null, 'description'), ' — 建议，一句话简介，显示在人设卡列表'),
+              React.createElement('li', null, React.createElement('b', null, 'tags'), ' — 可选，标签数组，如 [温柔, 教育]'),
+              React.createElement('li', null, React.createElement('b', null, 'style'), ' — 可选，语气风格关键词（formal / friendly / playful / terse）'),
+              React.createElement('li', null, React.createElement('b', null, 'apply'), ' — 可选，preset=安装为预设（默认） / session=仅当前会话即时应用'),
+            ),
+            React.createElement('p', { className: 'sid-chara-format-note' },
+              '正文写法：用「你是……」「你应……」第二人称指令句，写清身份、说话语气、用词习惯、行为规则与边界，越具体越好。'),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-head' },
+              React.createElement('div', { className: 'sid-chara-format-sec-title' }, '模板'),
+              copyBtn('模板', SIDCHARA_FMT_MD),
+            ),
+            React.createElement('pre', { className: 'sid-chara-format-code' }, SIDCHARA_FMT_MD),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-title' }, '使用步骤'),
+            steps([
+              '复制上方模板，粘贴到文本编辑器',
+              '填写 id、name、description、tags，并在正文写人设要求',
+              '保存为「你的名字.persona.md」',
+              '回到本页点「批量导入人设卡」选择该文件（或拖入虚线框）',
+              '在导入预览中确认，点「确认导入」',
+              '列表出现后，点「应用到当前会话」立即试用，或「安装为预设」长期使用',
+            ]),
+          ),
+        )
+      } else if (st.tab === 'tavern') {
+        body = React.createElement(React.Fragment, null,
+          React.createElement('p', { className: 'sid-chara-format-note' },
+            '兼容导入 SillyTavern / 酒馆角色卡 JSON：不需要手工转换，导入时自动把角色信息拼装成人设正文。'),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-title' }, '转换规则'),
+            React.createElement('ul', { className: 'sid-chara-format-fields' },
+              React.createElement('li', null, React.createElement('b', null, 'name'), ' → 人设名称'),
+              React.createElement('li', null, React.createElement('b', null, 'description / char_persona'), ' → 角色设定'),
+              React.createElement('li', null, React.createElement('b', null, 'personality'), ' → 性格'),
+              React.createElement('li', null, React.createElement('b', null, 'scenario'), ' → 场景'),
+              React.createElement('li', null, React.createElement('b', null, 'first_mes'), ' → 开场白'),
+              React.createElement('li', null, React.createElement('b', null, 'mes_example'), ' → 对话示例'),
+            ),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-head' },
+              React.createElement('div', { className: 'sid-chara-format-sec-title' }, 'JSON 示例'),
+              copyBtn('示例', SIDCHARA_FMT_TAVERN),
+            ),
+            React.createElement('pre', { className: 'sid-chara-format-code' }, SIDCHARA_FMT_TAVERN),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-title' }, '使用步骤'),
+            steps([
+              '在酒馆前端导出角色卡 JSON（或直接用已有的 .json 文件）',
+              '选择 / 拖入导入区，导入预览中该卡会带「酒馆」标记',
+              '确认导入后即可应用；想微调内容，可先用「AI 转换教程」生成 .persona.md 再导入',
+            ]),
+          ),
+          React.createElement('p', { className: 'sid-chara-format-note' },
+            '说明：PNG 内嵌角色卡（酒馆 v2 图片卡）暂不支持，请先在酒馆前端导出 JSON。'),
+        )
+      } else if (st.tab === 'pack') {
+        body = React.createElement(React.Fragment, null,
+          React.createElement('p', { className: 'sid-chara-format-note' },
+            '批量打包清单：一份 .sidor-persona-pack.json 可包含多张人设卡，适合批量分发、备份与迁移。'),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-title' }, '结构说明'),
+            React.createElement('ul', { className: 'sid-chara-format-fields' },
+              React.createElement('li', null, React.createElement('b', null, 'format'), ' — 固定 "sidor-persona-pack"'),
+              React.createElement('li', null, React.createElement('b', null, 'version'), ' — 1'),
+              React.createElement('li', null, React.createElement('b', null, 'personas'), ' — 数组，每项 { frontmatter: {…元信息}, body: "人设正文" }，字段同 .persona.md'),
+            ),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-head' },
+              React.createElement('div', { className: 'sid-chara-format-sec-title' }, '示例'),
+              copyBtn('示例', SIDCHARA_FMT_PACK),
+            ),
+            React.createElement('pre', { className: 'sid-chara-format-code' }, SIDCHARA_FMT_PACK),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-title' }, '使用步骤'),
+            steps([
+              '把每张卡的元信息写入 frontmatter、人设正文写入 body',
+              '保存为 .sidor-persona-pack.json',
+              '选择 / 拖入导入区，预览中会列出全部卡片，确认后一次性导入',
+            ]),
+          ),
+        )
+      } else {
+        body = React.createElement(React.Fragment, null,
+          React.createElement('p', { className: 'sid-chara-format-note' },
+            '把手头任意角色资料（对话风格、旧版人设、角色设定文档）交给 AI，自动整理成受支持的 .persona.md 格式。'),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-title' }, '使用步骤'),
+            steps([
+              '点下方【复制提示词】',
+              '把提示词粘贴到任意 AI 对话，并在「原始内容」处粘贴你的角色描述',
+              'AI 会输出一份完整的 .persona.md 文件内容',
+              '把输出保存为「你的名字.persona.md」',
+              '回到本页导入即可',
+            ]),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-sec' },
+            React.createElement('div', { className: 'sid-chara-format-sec-head' },
+              React.createElement('div', { className: 'sid-chara-format-sec-title' }, '转换提示词'),
+              copyBtn('提示词', SIDCHARA_FMT_AI),
+            ),
+            React.createElement('pre', { className: 'sid-chara-format-code' }, SIDCHARA_FMT_AI),
+          ),
+          React.createElement('p', { className: 'sid-chara-format-note' },
+            '提示：如果你手头是酒馆 JSON 角色卡，直接导入即可，无需 AI 转换。'),
+        )
+      }
+      return React.createElement('div', {
+        className: 'sid-chara-format-overlay',
+        role: 'presentation',
+        onPointerDown: (e) => { if (e.target === e.currentTarget) sidCharaFormatClose() },
+      },
+        React.createElement('div', { className: 'sid-chara-format-card', role: 'dialog', 'aria-modal': 'true', 'aria-label': '人设卡文件格式教程' },
+          React.createElement('div', { className: 'sid-chara-format-head' },
+            React.createElement('span', { className: 'sid-chara-format-title' }, '格式说明与教程'),
+            React.createElement('button', { type: 'button', className: 'sid-chara-card-btn', onClick: sidCharaFormatClose }, '关闭'),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-tabs', role: 'tablist' },
+            tabBtn('md', '.persona.md'),
+            tabBtn('tavern', '酒馆角色卡'),
+            tabBtn('pack', '批量打包'),
+            tabBtn('ai', 'AI 转换教程'),
+          ),
+          React.createElement('div', { className: 'sid-chara-format-body', role: 'tabpanel' }, body),
+        ),
+      )
+    }
+
+    /* ============ 组件：Toast ============ */
+    function CharaToast() {
+      const [st, setSt] = React.useState({ text: sidChara.toast, seq: sidChara.toastSeq })
+      React.useEffect(() => sidCharaSubscribe(() => setSt({ text: sidChara.toast, seq: sidChara.toastSeq })), [])
+      React.useEffect(() => {
+        if (st.text === '') return
+        const d = ctx.timeout(() => sidCharaToastClear(), 4200)
+        return () => d()
+      }, [st.seq])
+      if (st.text === '') return null
+      return React.createElement('div', { className: 'sid-chara-toast', role: 'status' },
+        React.createElement('span', { className: 'sid-chara-toast-ic', 'aria-hidden': true, dangerouslySetInnerHTML: { __html: ICON_CHARA } }),
+        React.createElement('span', null, st.text),
+      )
+    }
+
+    /* ============ 组件：导入区 ============ */
+    function CharaImportZone() {
+      const [drag, setDrag] = React.useState(false)
+      const inputRef = React.useRef(null)
+      const pick = () => { const el = inputRef.current; if (el) el.click() }
+      const onFiles = (list) => { sidCharaReadFiles(list) }
+      return React.createElement('div', { className: 'sid-chara-import' },
+        React.createElement('input', {
+          ref: inputRef,
+          type: 'file',
+          multiple: true,
+          accept: '.persona.md,.md,.json',
+          style: { display: 'none' },
+          onChange: (e) => { onFiles(e.target.files); e.target.value = '' },
+        }),
+        React.createElement('div', { className: 'sid-chara-import-btns' },
+          React.createElement('button', {
+            type: 'button',
+            className: 'sid-chara-import-btn',
+            onClick: pick,
+          },
+            React.createElement('span', { className: 'sid-chara-import-ic', 'aria-hidden': true, dangerouslySetInnerHTML: { __html: ICON_IMPORT } }),
+            '批量导入人设卡',
+          ),
+          React.createElement('button', {
+            type: 'button',
+            className: 'sid-chara-import-btn sid-chara-import-btn-ghost',
+            onClick: sidCharaFormatOpen,
+          },
+            React.createElement('span', { className: 'sid-chara-import-ic', 'aria-hidden': true, dangerouslySetInnerHTML: { __html: ICON_INFO } }),
+            '格式说明与模板',
+          ),
+        ),
+        React.createElement('div', {
+          className: 'sid-chara-drop' + (drag ? ' over' : ''),
+          onDragOver: (e) => { e.preventDefault(); setDrag(true) },
+          onDragLeave: () => setDrag(false),
+          onDrop: (e) => {
+            e.preventDefault()
+            setDrag(false)
+            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) onFiles(e.dataTransfer.files)
+          },
+        },
+          '或将 .persona.md / .json 人设卡文件拖到这里（可多选，支持酒馆角色卡）',
+        ),
+      )
+    }
+
+    /* ============ 组件：导入预览 ============ */
+    function CharaPreviewPanel() {
+      const [st, setSt] = React.useState({ preview: sidChara.preview })
+      React.useEffect(() => sidCharaSubscribe(() => setSt({ preview: sidChara.preview })), [])
+      const pv = st.preview
+      if (!pv) return null
+      return React.createElement('div', { className: 'sid-chara-preview', role: 'dialog', 'aria-modal': 'true', 'aria-label': '导入预览' },
+        React.createElement('div', { className: 'sid-chara-preview-head' },
+          React.createElement('span', { className: 'sid-chara-preview-title' }, '导入预览（' + pv.cards.length + ' 张卡）'),
+          React.createElement('button', { type: 'button', className: 'sid-chara-card-btn', onClick: sidCharaCancelImport }, '取消'),
+        ),
+        pv.errors && pv.errors.length ? React.createElement('div', { className: 'sid-chara-preview-errors' },
+          pv.errors.map((e, i) => React.createElement('div', { key: 'err-' + i, className: 'sid-chara-preview-err' },
+            e.name + '：' + e.errors.join('；'))),
+        ) : null,
+        pv.cards.some((r) => !!sidChara.personas[r.card.id]) ? React.createElement('div', { className: 'sid-chara-preview-hint' },
+          '以下人设卡与现有卡 id 重复，请为每张冲突卡选择处理方式：') : null,
+        pv.cards.map((row, i) => {
+          const c = row.card
+          const conflict = !!sidChara.personas[c.id]
+          return React.createElement('div', { key: c.id + '-' + i, className: 'sid-chara-preview-row' },
+            React.createElement('span', { className: 'sid-chara-preview-row-ic', 'aria-hidden': true, dangerouslySetInnerHTML: { __html: ICON_CHARA } }),
+            React.createElement('div', { className: 'sid-chara-preview-row-main' },
+              React.createElement('div', { className: 'sid-chara-preview-row-title' }, c.name + '（' + c.id + '）' + (c.source === 'tavern' ? ' · 酒馆' : '')),
+              React.createElement('div', { className: 'sid-chara-preview-row-desc' }, c.description || '（无简介）'),
+            ),
+            conflict
+              ? React.createElement('select', {
+                  className: 'sid-chara-select',
+                  value: row.action,
+                  onChange: (e) => sidCharaPreviewSetAction(i, e.target.value),
+                  'aria-label': c.name + ' 冲突处理',
+                },
+                  React.createElement('option', { value: 'skip' }, '跳过（保留现有）'),
+                  React.createElement('option', { value: 'overwrite' }, '覆盖（替换现有）'),
+                  React.createElement('option', { value: 'rename' }, '重命名（作为新卡）'),
+                )
+              : React.createElement('span', { className: 'sid-chara-badge sid-chara-badge-new' }, '新增'),
+            row.action === 'rename' ? React.createElement('input', {
+              className: 'sid-chara-input',
+              type: 'text',
+              placeholder: '新 id（小写字母/数字/中划线）',
+              value: row.newId,
+              onChange: (e) => sidCharaPreviewRename(i, e.target.value),
+            }) : null,
+          )
+        }),
+        React.createElement('div', { className: 'sid-chara-preview-actions' },
+          React.createElement('button', { type: 'button', className: 'sid-chara-card-btn sid-chara-confirm-primary', onClick: sidCharaConfirmImport }, '确认导入'),
+        ),
+      )
+    }
+
+    /* ============ 组件：单张人设卡 ============ */
+    function CharaCardRow({ card }) {
+      const [st, setSt] = React.useState({ currentId: sidChara.currentId, busy: sidChara.busy })
+      React.useEffect(() => sidCharaSubscribe(() => setSt({ currentId: sidChara.currentId, busy: sidChara.busy })), [])
+      const isCurrent = st.currentId === card.id
+      const tags = (card.tags && card.tags.length) ? card.tags.join(' · ') : ''
+      return React.createElement('div', { className: 'sid-chara-card' },
+        React.createElement('div', { className: 'sid-chara-card-head' },
+          React.createElement('span', { className: 'sid-chara-card-ic', 'aria-hidden': true, dangerouslySetInnerHTML: { __html: ICON_CHARA } }),
+          React.createElement('span', { className: 'sid-chara-card-title' }, card.name),
+          isCurrent ? React.createElement('span', { className: 'sid-chara-badge sid-chara-badge-current' }, '当前生效') : null,
+          card.installed ? React.createElement('span', { className: 'sid-chara-badge sid-chara-badge-installed' }, '已装预设') : null,
+        ),
+        tags ? React.createElement('div', { className: 'sid-chara-card-tags' }, tags) : null,
+        card.description ? React.createElement('p', { className: 'sid-chara-card-desc' }, card.description) : null,
+        React.createElement('div', { className: 'sid-chara-card-row' },
+          React.createElement('span', { className: 'sid-chara-card-row-label' }, card.id + (card.source === 'tavern' ? ' · 酒馆导入' : '')),
+        ),
+        React.createElement('div', { className: 'sid-chara-card-actions' },
+          React.createElement('button', {
+            type: 'button',
+            className: 'sid-chara-card-btn',
+            disabled: st.busy,
+            title: '在当前会话立即生效，可随时切换或停用',
+            onClick: () => sidCharaApplySession(card.id),
+          }, '应用到当前会话'),
+          React.createElement('button', {
+            type: 'button',
+            className: 'sid-chara-card-btn',
+            disabled: st.busy,
+            title: '保存为 Agent 预设，新建会话时可在「设置 → Agent 预设」中选用',
+            onClick: () => sidCharaInstallPreset(card.id),
+          }, card.installed ? '重新安装预设' : '安装为预设'),
+          isCurrent ? React.createElement('button', {
+            type: 'button',
+            className: 'sid-chara-card-btn',
+            disabled: st.busy,
+            onClick: () => sidCharaDisable(),
+          }, '停用') : null,
+          card.installed ? React.createElement('button', {
+            type: 'button',
+            className: 'sid-chara-card-btn',
+            disabled: st.busy,
+            onClick: () => sidCharaRemovePreset(card.id),
+          }, '卸载预设') : null,
+          React.createElement('button', {
+            type: 'button',
+            className: 'sid-chara-card-btn sid-chara-card-btn-danger',
+            disabled: st.busy,
+            onClick: () => sidCharaDeleteCard(card.id),
+          }, '删除'),
+        ),
+      )
+    }
+
+    /* ============ 组件：设置页 ============ */
+    function CharacterSettingsPage() {
+      const [st, setSt] = React.useState({
+        personas: sidChara.personas,
+        currentId: sidChara.currentId,
+        busy: sidChara.busy,
+      })
+      React.useEffect(() => {
+        const u = sidCharaSubscribe(() => setSt({
+          personas: sidChara.personas,
+          currentId: sidChara.currentId,
+          busy: sidChara.busy,
+        }))
+        sidCharaRefreshInstalled()
+        return () => u()
+      }, [])
+      const list = Object.keys(st.personas).map((k) => st.personas[k])
+      return React.createElement('div', { className: 'sid-chara-page' },
+        React.createElement('div', { className: 'sid-chara-head' },
+          React.createElement('h3', { className: 'sid-chara-page-title' }, '人设卡'),
+        ),
+        React.createElement('p', { className: 'sid-chara-page-desc' },
+          '人设卡用于定制 Agent 与你的交流风格：先导入人设卡文件，再选择使用方式。'),
+        React.createElement('div', { className: 'sid-chara-guide' },
+          React.createElement('div', { className: 'sid-chara-guide-row' },
+            React.createElement('span', { className: 'sid-chara-guide-k' }, '应用到当前会话'),
+            React.createElement('span', { className: 'sid-chara-guide-v' }, '在当前会话立即生效，适合先试用、随时切换或停用。'),
+          ),
+          React.createElement('div', { className: 'sid-chara-guide-row' },
+            React.createElement('span', { className: 'sid-chara-guide-k' }, '安装为预设'),
+            React.createElement('span', { className: 'sid-chara-guide-v' }, '保存为 Agent 预设，之后新建会话时可在「设置 → Agent 预设」中选用，长期生效。'),
+          ),
+        ),
+        React.createElement(CharaImportZone),
+        React.createElement(CharaPreviewPanel),
+        list.length === 0
+          ? React.createElement('div', { className: 'sid-chara-empty' },
+              '还没有人设卡。点击「批量导入人设卡」，或将 .persona.md 文件拖入导入区。' +
+              '文件格式：开头用 --- 包裹人设信息（名称 / 简介 / 标签），下方正文即人设要求。')
+          : React.createElement('div', { className: 'sid-chara-list' },
+              list.map((c) => React.createElement(CharaCardRow, { key: c.id, card: c })),
+            ),
+        React.createElement(CharaFormatDialog),
+        React.createElement(CharaToast),
+      )
+    }
+
+    /* ============ styles ============ */
+    styles.insert(`
+/* ---- SIDOR 人设卡：设置页 ---- */
+.sid-chara-page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 620px;
+}
+.sid-chara-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.sid-chara-page-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+.sid-chara-page-desc {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-guide {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-l1, transparent);
+}
+.sid-chara-guide-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.sid-chara-guide-k {
+  flex: none;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+  white-space: nowrap;
+}
+.sid-chara-guide-v {
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  background: var(--dsw-alias-interactive-bg-hover, transparent);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.sid-chara-badge-current {
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 45%, transparent);
+  color: var(--dsw-alias-brand-primary);
+}
+.sid-chara-badge-installed {
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success, #3fb950) 45%, transparent);
+  color: var(--dsw-alias-state-success, #3fb950);
+}
+.sid-chara-badge-new {
+  border-color: var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-secondary);
+  flex: none;
+}
+
+/* 导入区 */
+.sid-chara-import {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sid-chara-import-btns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.sid-chara-import-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary) 55%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sid-chara-import-btn:hover {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 20%, transparent);
+}
+.sid-chara-import-btn-ghost {
+  background: transparent;
+  border-color: var(--dsw-alias-border-l2);
+  font-weight: 500;
+}
+.sid-chara-import-btn-ghost:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.sid-chara-import-btn-ghost .sid-chara-import-ic {
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-import-ic {
+  display: inline-flex;
+  color: var(--dsw-alias-brand-primary);
+}
+.sid-chara-import-ic svg { width: 15px; height: 15px; }
+.sid-chara-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 52px;
+  padding: 10px 14px;
+  border: 1px dashed var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  color: var(--dsw-alias-label-caption, var(--dsw-alias-label-secondary));
+  font-size: 12px;
+  text-align: center;
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+.sid-chara-drop.over {
+  border-color: var(--dsw-alias-brand-primary);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 8%, transparent);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* 导入预览 */
+.sid-chara-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-l1, transparent);
+}
+.sid-chara-preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sid-chara-preview-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+.sid-chara-preview-errors {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sid-chara-preview-err {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-state-error-primary, #e5534b);
+  word-break: break-all;
+}
+.sid-chara-preview-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-caption, var(--dsw-alias-label-secondary));
+}
+.sid-chara-preview-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  padding: 6px 0;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+.sid-chara-preview-row:first-of-type { border-top: none; }
+.sid-chara-preview-row-ic {
+  display: inline-flex;
+  flex: none;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-preview-row-ic svg { width: 16px; height: 16px; }
+.sid-chara-preview-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.sid-chara-preview-row-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+  word-break: break-all;
+}
+.sid-chara-preview-row-desc {
+  font-size: 12px;
+  color: var(--dsw-alias-label-secondary);
+  word-break: break-all;
+}
+.sid-chara-preview-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+/* 人设卡列表 */
+.sid-chara-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+.sid-chara-empty {
+  padding: 22px 16px;
+  border: 1px dashed var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  color: var(--dsw-alias-label-caption, var(--dsw-alias-label-secondary));
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: center;
+}
+.sid-chara-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-l1, transparent);
+}
+.sid-chara-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.sid-chara-card-ic {
+  display: inline-flex;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-card-ic svg { width: 16px; height: 16px; }
+.sid-chara-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+.sid-chara-card-tags {
+  font-size: 12px;
+  color: var(--dsw-alias-brand-primary);
+}
+.sid-chara-card-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-card-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+}
+.sid-chara-card-row-label {
+  flex: 1;
+  font-size: 12px;
+  color: var(--dsw-alias-label-caption, var(--dsw-alias-label-secondary));
+  min-width: 0;
+  word-break: break-all;
+}
+.sid-chara-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 2px;
+}
+.sid-chara-card-btn {
+  height: 26px;
+  padding: 0 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sid-chara-card-btn:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.sid-chara-card-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.sid-chara-card-btn-danger {
+  color: var(--dsw-alias-state-error-primary, #e5534b);
+}
+.sid-chara-confirm-primary {
+  background: var(--dsw-alias-brand-primary);
+  border-color: transparent;
+  color: #000;
+  font-weight: 600;
+}
+.sid-chara-confirm-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 88%, #000);
+}
+.sid-chara-input {
+  flex: 0 1 200px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-input-bg, var(--dsw-alias-bg-base));
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  outline: none;
+}
+.sid-chara-input:focus {
+  border-color: var(--dsw-alias-brand-primary);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-brand-primary) 25%, transparent);
+}
+.sid-chara-select {
+  flex: none;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-input-bg, var(--dsw-alias-bg-base));
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  outline: none;
+}
+
+/* 格式说明弹窗 */
+.sid-chara-format-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, #000 45%, transparent);
+  animation: sid-chara-fade-in 0.18s ease;
+}
+.sid-chara-format-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(600px, calc(100vw - 48px));
+  max-height: calc(100vh - 96px);
+  overflow-y: auto;
+  padding: 16px 18px;
+  background: var(--dsw-specific-menu, var(--dsw-alias-bg-overlay, #16181e));
+  border: 1px solid var(--dsw-alias-border-inverted, var(--dsw-alias-border-l2, rgba(128, 128, 128, 0.35)));
+  border-radius: 12px;
+  box-shadow: var(--dsw-shadow-lv3, 0 12px 40px rgba(0, 0, 0, 0.35));
+  color: var(--dsw-alias-label-primary);
+  animation: sid-chara-pop-in 0.2s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.sid-chara-format-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sid-chara-format-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+.sid-chara-format-sec {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sid-chara-format-sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sid-chara-format-sec-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--dsw-alias-label-primary);
+}
+.sid-chara-format-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-format-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-format-code {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: var(--dsw-alias-input-bg, var(--dsw-alias-bg-base));
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 1.6;
+  font-family: ui-monospace, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.sid-chara-copy-btn {
+  flex: none;
+}
+.sid-chara-format-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+}
+.sid-chara-format-tab {
+  height: 26px;
+  padding: 0 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sid-chara-format-tab:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.sid-chara-format-tab.active {
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary) 55%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+.sid-chara-format-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.sid-chara-format-fields {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-format-fields b {
+  color: var(--dsw-alias-label-primary);
+  font-weight: 600;
+}
+.sid-chara-format-steps {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--dsw-alias-label-secondary);
+}
+@keyframes sid-chara-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes sid-chara-pop-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* 页面内 toast */
+.sid-chara-toast {
+  position: fixed;
+  right: 12px;
+  top: 16px;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(340px, calc(100vw - 32px));
+  padding: 8px 14px;
+  background: var(--dsw-specific-menu, var(--dsw-alias-bg-overlay, #16181e));
+  border: 1px solid var(--dsw-alias-border-inverted, var(--dsw-alias-border-l2, rgba(128, 128, 128, 0.35)));
+  border-radius: 12px;
+  box-shadow: var(--dsw-shadow-lv3, 0 12px 40px rgba(0, 0, 0, 0.35));
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  line-height: 20px;
+  pointer-events: none;
+  animation: sid-chara-toast-in 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+.sid-chara-toast-ic {
+  display: inline-flex;
+  flex: none;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-toast-ic svg { width: 16px; height: 16px; }
+@keyframes sid-chara-toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* settings nav: 人设卡图标 */
+.sid-nav-chara {
+  display: inline-flex;
+  flex: none;
+  color: var(--dsw-alias-label-secondary);
+}
+.sid-nav-chara svg { width: 16px; height: 16px; }
+`)
+
+    /* ============ settings nav：官方齿轮 → 人设卡图标 ============ */
+    // 官方 navIcon(id) 对未知 id 一律回退齿轮图标。按 Sidor 既定模式：
+    // 「插到 svg 前面 + 隐藏 svg + 全局 MutationObserver 即时替换」，
+    // 按导航文字「人设卡」匹配自己的分区，500ms tick 仅作 React 重建 nav 的兜底。
+    ctx.effect(() => {
+      const w = typeof window !== 'undefined' ? window : null
+      const doc = w && w.document ? w.document : null
+      const MO = w && w.MutationObserver ? w.MutationObserver : null
+      let rootMo = null
+      let tickIv = null
+      const fixNavIcon = () => {
+        if (!doc || !w) return
+        try {
+          const cells = doc.querySelectorAll('[class*="settingsArea"] [class*="_nav"] [class*="navCell"]')
+          for (const cell of Array.from(cells)) {
+            if (!(cell instanceof w.HTMLElement)) continue
+            const label = cell.querySelector('[class*="navLabel"]')
+            if (!label || (label.textContent || '').trim() !== '人设卡') continue
+            const svg = cell.querySelector('svg[class*="navIcon"], [class*="navIcon"]')
+            if (!svg) continue
+            if (cell.querySelector('.sid-nav-chara')) {
+              svg.style.display = 'none'
+              continue
+            }
+            const wrapper = doc.createElement('span')
+            wrapper.className = 'sid-nav-chara'
+            wrapper.setAttribute('aria-hidden', 'true')
+            wrapper.innerHTML = ICON_CHARA
+            cell.insertBefore(wrapper, svg)
+            svg.style.display = 'none'
+          }
+        } catch (e) {
+          console.error('sidor-character: fixNavIcon failed', e)
+        }
+      }
+      try {
+        if (doc && MO) {
+          rootMo = new MO((muts) => {
+            let hit = false
+            for (const m of muts) {
+              const t = m.target
+              if (t && t.nodeType === 1 && typeof t.closest === 'function') {
+                if (t.closest('[class*="settingsArea"]')) { hit = true; break }
+              }
+            }
+            if (hit) fixNavIcon()
+          })
+          rootMo.observe(doc.body, { childList: true, subtree: true })
+        }
+      } catch (e) { /* body not ready yet */ }
+      tickIv = ctx.interval(fixNavIcon, 500)
+      return () => {
+        if (rootMo) rootMo.disconnect()
+        if (tickIv) tickIv()
+      }
+    })
+
+    /* ============ slot registrations ============ */
+    // 会话 id 捕获（通道 A 与 agent 代执行需要知道当前会话）。
+    slots.inject('conversation.input.dock', () => slots.register(
+      { name: 'conversation.input.dock', id: 'sidor-chara-dock', order: 60, label: '人设卡' },
+      (props) => React.createElement(SidCharaDockWatcher, props),
+    ))
+    // 设置页新分区：官方 settings.section 是 root 级 list 型插槽，按 order
+    // 自动排序。SIDOR 既有分区：sidor-balance=25、sidor-box=26，本分区=27。
+    slots.inject('settings.section', () => slots.register(
+      { name: 'settings.section', id: 'sidor-character', order: 27, label: '人设卡' },
+      () => React.createElement(CharacterSettingsPage),
+    ))
+  },
+}

@@ -1,0 +1,4 @@
+# SIDOR 人设卡（独立附属插件）：bundle 补丁（随 DSH 启动自动加载）
+- insert:
+    - id: sidor-character
+      name: sidor-character
