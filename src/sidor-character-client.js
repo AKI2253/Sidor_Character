@@ -921,7 +921,7 @@ return {
             type: 'button',
             className: 'sid-chara-card-btn',
             disabled: st.busy,
-            title: '保存为 Agent 预设，新建会话时可在「设置 → Agent 预设」中选用',
+            title: '保存为 Agent 预设，新建会话时可在「设置 → Agent 预设」中选用；安装新预设会自动替换旧预设',
             onClick: () => sidCharaInstallPreset(card.id),
           }, card.installed ? '重新安装预设' : '安装为预设'),
           isCurrent ? React.createElement('button', {
@@ -963,6 +963,10 @@ return {
         return () => u()
       }, [])
       const list = Object.keys(st.personas).map((k) => st.personas[k])
+      const hasCards = list.length > 0
+      const appliedNow = st.currentId !== null                          // 通道 A：已应用到当前会话
+      const installedAny = list.some((c) => c.installed === true)       // 通道 B：已安装为 Agent 预设
+      const needsReminder = hasCards && !appliedNow
       return React.createElement('div', { className: 'sid-chara-page' },
         React.createElement('div', { className: 'sid-chara-head' },
           React.createElement('h3', { className: 'sid-chara-page-title' }, '人设卡'),
@@ -976,9 +980,14 @@ return {
           ),
           React.createElement('div', { className: 'sid-chara-guide-row' },
             React.createElement('span', { className: 'sid-chara-guide-k' }, '安装为预设'),
-            React.createElement('span', { className: 'sid-chara-guide-v' }, '保存为 Agent 预设，之后新建会话时可在「设置 → Agent 预设」中选用，长期生效。'),
+            React.createElement('span', { className: 'sid-chara-guide-v' }, '保存为 Agent 预设，之后新建会话时可在「设置 → Agent 预设」中选用；同一时间只保留一个人设预设。'),
           ),
         ),
+        needsReminder ? React.createElement('div', { className: 'sid-chara-reminder' },
+          installedAny
+            ? '已导入 ' + list.length + ' 张人设卡。想让 Agent 采用人设：点卡片上的「应用到当前会话」立即在当前会话生效；已安装的预设请在新建会话时于「设置 → Agent 预设」中选择（运行中的会话不会自动切换）。'
+            : '已导入 ' + list.length + ' 张人设卡。点「应用到当前会话」立即在当前会话生效（可随时切换/停用），或点「安装为预设」保存为 Agent 预设，之后新建会话时选用。'
+        ) : null,
         React.createElement(CharaImportZone),
         React.createElement(CharaPreviewPanel),
         list.length === 0
@@ -1044,6 +1053,15 @@ return {
 }
 .sid-chara-guide-v {
   color: var(--dsw-alias-label-secondary);
+}
+.sid-chara-reminder {
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary) 35%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary) 7%, transparent);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 1.55;
 }
 .sid-chara-badge {
   display: inline-flex;
