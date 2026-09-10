@@ -20,21 +20,26 @@
 
 ### 2.1 DSH 原生人设机制：`@deepseek-ai/dsh-persona`
 
-每个 agent 预设的 `agent.cordis.yml` 里都有一行人设（standard 预设原文）：
+每个 agent 预设的 `agent.cordis.yml` 里都有一行人设。**DSH 0.1.5 起字段名为 `prefix`（必填），0.1.4 及更早为 `text`**——旧写法会导致预设挂载失败
+（`invalid config: $.prefix`）。standard 预设原文（0.1.5）：
 
 ```yaml
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    text: >-
-      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.
+    suffix: Your working directory is {{cwd}}.
+    prefix: >-
+      You are a coding agent powered by the {{model}} model.
 ```
 
-- `config.text` 即**系统提示级的人设文本**，直接决定 agent 与用户交流的风格；
-- `{{model}}` / `{{cwd}}` 由 agent 自身路由/工作区解析；
+- `config.prefix` 即**系统提示级的人设文本**（渲染为 `deployment:persona-prefix` 段），直接决定 agent 与用户交流的风格；**必填**，缺失即整行挂载失败；
+- `config.suffix`（可选，默认 `''`）渲染在第一方指引之后；**省略或留空会遮蔽部署级后缀**；
+- `config.complete`（可选，默认 `false`）：`true` 时 `prefix` 直接作为完整系统提示词，抑制后缀与其余所有段；
+- `config.includeRuntimeContext`（可选，默认 `true`）：`false` 时该人设作用域不注入动态 runtime-context；
+- `{{model}}` / `{{cwd}}` 由 agent 自身路由/工作区解析，`{{…}}` 按注册表**严格插值**（未知变量报错，勿写自定义占位符）；
 - 预设自带的人设会**遮蔽部署默认人设**。
 
-→ **结论**：把人设卡正文写入某预设的 `persona.text`，即从系统提示层面改变交流风格。
+→ **结论**：把人设卡正文追加到某预设的 `persona.prefix`，即从系统提示层面改变交流风格。
 这是 DSH 的正统机制，能被官方界面（设置 → Agent 预设、新建会话选择器）管理与选择。
 
 ### 2.2 预设注册表服务：`ctx.agentPresets`
@@ -70,7 +75,7 @@ sidorHostRpc('session.prompt', {
 ### 3.1 原生格式：`.persona.md`（推荐，主格式）
 
 **Markdown + YAML front matter**，扩展名 `.persona.md`。front matter 只承载 UI 元数据，
-**正文即人设指令**（应用时直接发送/写入 persona.text），不引入额外 DSL。
+**正文即人设指令**（应用时直接发送；安装预设时追加到 `persona.prefix`），不引入额外 DSL。
 
 ```markdown
 ---
@@ -86,7 +91,7 @@ apply: preset              # 可选：默认应用方式 —— session(仅当�
 style: friendly            # 可选：formal / friendly / playful / terse / custom —— UI 徽标与生成应用指令
 temperature: 0.7           # 可选：建议采样温度（仅展示提示，不强加）
 ---
-<!-- 人设正文（Markdown）：发给 agent 的人设指令，写入 dsh-persona 的 config.text -->
+<!-- 人设正文（Markdown）：发给 agent 的人设指令；安装预设时追加到 dsh-persona 的 prefix -->
 你是「知性学姐」。与用户交流时：
 - 语气温和、耐心，常用「我们一起来看」开头讲解；
 - 讲知识先给结论，再用生活化的例子展开；
@@ -159,11 +164,11 @@ sidPromptAgent(
 
 ```
 ~/.dsh/.agent-presets/<card.id>/
-├── agent.cordis.yml   # 复制 standard 基底 + 改写 persona 行的 config.text
+├── agent.cordis.yml   # 复制 standard 基底 + 把正文追加到 persona 行的 prefix
 └── preset.yml         # name: SIDOR 人设 · <card.name>；description: <card.description>
 ```
 
-`persona.text` 合成规则：`<standard 基底人设> + "\n\n【人设卡】" + <人设正文>`。
+`persona.prefix` 合成规则：`<standard 基底 prefix> + "\n\n【人设卡】" + <人设正文>`（DSH 0.1.5+ 字段名为 `prefix`，旧版为 `text`；`suffix` 保持不变）。
 
 - **动态形态（增强）**：host 半 `inject: ['agentPresets']`，注册
   `harness.handle('sidor-chara/preset-install'|'preset-remove'|'preset-list')`，

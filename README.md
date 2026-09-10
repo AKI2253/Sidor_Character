@@ -85,7 +85,7 @@ dsh plugin --profile web add <Sidor_Character 仓库路径>
 | ① | 批量导入人设卡 | 多选 / 拖拽导入 `.persona.md`（主格式）与酒馆角色卡 JSON / pack JSON；浏览器内解析，冲突支持覆盖/跳过/重命名 |
 | ② | 人设卡管理 | 人设卡列表（名称/标签/简介/状态），应用 / 停用 / 删除 |
 | ③ | 应用到当前会话 | 经官方 `/api session.prompt` 向当前会话发送人设指令，立即生效、可随时换卡/停用（动态/静态形态通用） |
-| ④ | 安装为 Agent 预设 | 人设 → 用户 agent 预设（复制 standard + 改写 `@deepseek-ai/dsh-persona` 的 `config.text`），新建会话时选用，持久生效；**单预设制**：安装新预设自动替换旧预设 |
+| ④ | 安装为 Agent 预设 | 人设 → 用户 agent 预设（复制 standard + 把正文追加到 `@deepseek-ai/dsh-persona` 的 `prefix`；DSH 0.1.5+ 字段名为 `prefix`，0.1.4 及更早为 `text`），新建会话时选用，持久生效；**单预设制**：安装新预设自动替换旧预设 |
 | ⑤ | 格式说明与模板 | 分 tab 教程：`.persona.md` / 酒馆角色卡 / 批量打包 / AI 转换提示词，模板与示例一键复制 |
 
 ## 人设卡文件格式（`.persona.md`）
@@ -100,7 +100,7 @@ description: 博学温柔的学姐，用浅显的方式讲解知识
 tags: [温柔, 教育, 中文]
 apply: preset
 ---
-（人设正文：即应用时发送/写入 dsh-persona config.text 的人设指令）
+（人设正文：即应用时发送、安装预设时追加到 dsh-persona `prefix` 的人设指令）
 ```
 
 示例见 [`examples/知性学姐.persona.md`](examples/知性学姐.persona.md) 与
