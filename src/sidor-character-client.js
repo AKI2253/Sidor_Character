@@ -138,17 +138,28 @@ return {
     }
 
     /* ============ 官方 /api RPC（同源 fetch，双形态通用） ============ */
-    async function sidCharaHostRpc(method, payload) {
-      const rpcId = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+    // 信封随 DSH 版本变化，两种都支持：
+    // · 0.1.5+（含 0.2.x）：POST /api/<a>/<b>，body.method 必须等于该斜杠端点，
+    //   参数经 payload.args 传递，键名 = 远端方法的形参名（如 session/prompt(request) → { request }）；
+    // · 0.1.4-：POST /api/<a>.<b>（点号端点），payload 为裸参数对象。
+    // 新版优先，端点不存在（404）时回退旧版。
+    function sidCharaRpcId() {
+      return (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
         ? crypto.randomUUID()
         : 'sid-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)
+    }
+
+    async function sidCharaRpcPost(method, payload) {
       const w = typeof window !== 'undefined' ? window : null
       if (!w) throw new Error('no window')
+      const rpcId = sidCharaRpcId()
       const res = await w.fetch('/api/' + method, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ type: 'client-request', rpcId: rpcId, method: method, payload: payload || {} }),
       })
+      // 404 = 该端点不存在（版本不匹配），交由调用方决定是否回退
+      if (res.status === 404) return { missing: true }
       if (!res.ok) throw new Error('host ' + method + ' HTTP ' + res.status)
       const json = await res.json()
       if (!json || json.type !== 'server-response' || json.rpcId !== rpcId) throw new Error('host ' + method + ' 响应无效')
@@ -158,17 +169,35 @@ return {
         const msg = err && typeof err.message === 'string' ? err.message : (err ? JSON.stringify(err) : '请求失败')
         throw new Error(msg)
       }
-      return result.value
+      return { value: result.value }
     }
 
     /* 会话内指令（通道 A 与静态形态 agent 代执行共用） */
     async function sidCharaPromptAgent(text) {
       if (!sidCharaSessionId) throw new Error('未检测到当前会话：请先打开一个会话，再执行该操作')
-      await sidCharaHostRpc('session.prompt', {
+      const content = [{ type: 'text', text: text }]
+      const request = {
+        requestId: sidCharaRpcId(),   // 0.1.5+ 必填：客户端生成的消息身份
         sessionId: sidCharaSessionId,
         mode: 'queue',
-        content: [{ type: 'text', text: text }],
+        content: content,
+      }
+      try {
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
+        if (tz) request.clientTimeZone = tz
+      } catch (e) { /* 时区可选，取不到就省略 */ }
+      // 新版：POST /api/session/prompt，args = { request }
+      const modern = await sidCharaRpcPost('session/prompt', { args: { request: request } })
+      if (!modern.missing) return
+      // 旧版回退：POST /api/session.prompt，裸 payload
+      const legacy = await sidCharaRpcPost('session.prompt', {
+        sessionId: request.sessionId,
+        mode: request.mode,
+        content: request.content,
       })
+      if (legacy.missing) {
+        throw new Error('当前 DSH 版本的会话指令端点不可用（session/prompt 与 session.prompt 均返回 404），请确认 DSH 版本与插件是否匹配')
+      }
     }
 
     /* 宿主 RPC（动态形态走 host.call；静态形态一律 reject → 返回 null 走降级） */

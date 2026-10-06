@@ -1,6 +1,6 @@
 {
   "name": "sidor-character",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "SIDOR 人设卡 —— DeepSeek Harness 独立附属插件：批量导入人设卡（.persona.md / 酒馆角色卡），自由选择加载/更换人设，应用于 agent 与用户交流风格（会话内即时应用 + Agent 预设持久化）。与主皮肤 sidor-ui、工具箱 sidor-box 互相独立，官方插槽接入，可无冲突共存。",
   "keywords": [
     "deepseek-harness",

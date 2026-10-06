@@ -6,7 +6,7 @@
 ![静态持久化](https://img.shields.io/badge/形态-静态持久化-7c6cf0?style=flat-square)
 ![MIT](https://img.shields.io/badge/许可-MIT-2ea44f?style=flat-square)
 
-![版本](https://img.shields.io/badge/版本-v0.2.0-4f86f7?style=flat-square)
+![版本](https://img.shields.io/badge/版本-v0.2.1-4f86f7?style=flat-square)
 ![导入](https://img.shields.io/badge/导入-纯客户端解析-22c55e?style=flat-square)
 ![单预设制](https://img.shields.io/badge/预设-单预设制-8b5cf6?style=flat-square)
 
@@ -22,7 +22,8 @@ DeepSeek Harness Web GUI 的 **SIDOR 人设卡**（独立分发仓库，附属�
 与主皮肤 [Sidor_UI](../Sidor_UI)、工具箱 [Sidor_box](../Sidor_box) 是**互相独立的插件**
 ——可单独安装，也可并存，互不干扰（官方插槽 `settings.section` 按 `order` 自动排序共存）。
 
-当前版本：**v0.2.0** —— 批量导入人设卡 + 双通道应用（会话内即时 / Agent 预设持久化，单预设制）已落地。
+当前版本：**v0.2.1** —— 批量导入人设卡 + 双通道应用（会话内即时 / Agent 预设持久化，单预设制）；
+新增 DSH 0.2.0 网关适配（斜杠式 `/api` 端点 + `args` 信封，保留旧版回退）。
 
 ## 一键安装（dsh 端）
 
@@ -112,8 +113,13 @@ apply: preset
 Sidor_Character 为**静态持久化插件**（install.ps1 安装到 profile，随 DSH 启动自动加载），
 **无 host RPC 通道**。依赖宿主的能力（安装/卸载 Agent 预设、读写 `%USERPROFILE%\.dsh`）由
 客户端在检测到 `host.call` 不可用后**自动降级为「agent 代执行」**——通过官方 `/api`
-（session.prompt queue）向 Agent 发出精确指令，由 Agent 完成文件操作后汇报。
+（0.1.5+ 为 `POST /api/session/prompt`，参数经 `args.request` 传递且 `requestId` 必填；
+0.1.4- 为点号式 `session.prompt` 裸 payload；插件自动探测并回退）向 Agent 发出精确指令，
+由 Agent 完成文件操作后汇报。
 人设卡数据只存浏览器 localStorage（`sidor.character.prefs`），动态/静态共用。
+
+**已验证的 DSH 版本**：`0.2.0-rc.2`（斜杠式端点 + args 信封 + `requestId`）、`0.1.5`（同一信
+封）、`0.1.4` 及更早（点号式端点，走回退分支）。
 
 ## 开发
 
