@@ -44,10 +44,25 @@
 
 ### 2.2 预设注册表服务：`ctx.agentPresets`
 
-- `list()` / `resolve(id)`：**热发现**——运行时新建的预设立即可见，无需重启；
-- `copy(from, id, name)`：把现有预设整体复制为用户预设（`~/.dsh/.agent-presets/<id>/`）；
-- `read(id)` / `remove(id)`：读取 / 删除用户预设；
-- `recompose(agentCtx, id)`：把**尚未产出内容**的 agent 重链到另一预设（动态形态增强用）。
+**0.1.5-（目录式）**：`list()` / `resolve(id)` 热发现；`copy(from, id, name)` 把现有预设整体复制为用户预设
+（`~/.dsh/.agent-presets/<id>/`）；`read` / `remove`；`recompose(agentCtx, id)` 可把未产出内容的 agent 重链到另一预设。
+
+**0.2.0+（声明式，破坏性变更）**：注册表远端只暴露 `list()` / `read(id)` / `select(agentId, id)`——**没有写入接口**。
+预设由组合里的一行声明：
+
+```yaml
+- id: preset-<preset-id>
+  name: '@deepseek-ai/dsh-agent-preset'
+  config:
+    id: <preset-id>        # 必填
+    name / description / order   # 可选
+    plugins: [ … ]         # 必填：该预设的完整插件行列表（不继承）
+```
+
+- 用户预设与 Web 编辑器改动都落在 **profile 补丁** `%USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml`；
+- 旧的 `~/.dsh/.agent-presets/` 目录**不再被扫描**；
+- 官方发行预设 = `<DSH 安装目录>\packages\bundle\web-app\presets\{standard,cordis,minimal,ptc}.patch.yml`。
+  详见 Sidor_UI [`docs/PLAN-DSH-0.1.5-COMPAT.md`](../../Sidor_UI/docs/PLAN-DSH-0.1.5-COMPAT.md) §6。
 
 ### 2.3 会话内指令通道：官方 `/api session.prompt`
 
@@ -160,7 +175,28 @@ sidPromptAgent(
 
 ### 4.3 应用通道 B：预设化持久（系统提示级，推荐主通道）
 
-把当前人设安装为**用户 agent 预设**：
+把当前人设安装为**用户 agent 预设**。DSH 有过两代形态，插件按特征**自适应（A 优先、B 回退）**：
+
+**A. 0.2.0+ 声明式**（特征：存在 `<DSH 安装目录>\packages\bundle\web-app\presets\standard.patch.yml`）
+
+```yaml
+# 追加到 %USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml
+- insert:
+    - id: preset-<card.id>
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: <card.id>
+        name: SIDOR 人设 · <card.name>
+        description: <card.description>
+        order: 50
+        plugins: [ …standard 的完整 plugins 列表（persona 行已换成本人设）… ]
+```
+
+- 预设**不继承**：必须整份复制 `standard.patch.yml` 的 `config.plugins`；
+- `persona.prefix` 合成规则：`<standard 基底 prefix> + "\n\n【人设卡】" + <人设正文>`（`suffix` 保持不变）；
+- 改动 profile 补丁前先备份，且**不得改动/删除其他插件的条目**；**重启 DSH** 后出现在「设置 → Agent 预设」。
+
+**B. 0.1.5- 目录式**
 
 ```
 ~/.dsh/.agent-presets/<card.id>/
@@ -168,18 +204,17 @@ sidPromptAgent(
 └── preset.yml         # name: SIDOR 人设 · <card.name>；description: <card.description>
 ```
 
-`persona.prefix` 合成规则：`<standard 基底 prefix> + "\n\n【人设卡】" + <人设正文>`（DSH 0.1.5+ 字段名为 `prefix`，旧版为 `text`；`suffix` 保持不变）。
+- 字段名 `prefix`（0.1.5+；0.1.4- 为 `text`），`suffix` 保持不变。
 
-- **动态形态（增强）**：host 半 `inject: ['agentPresets']`，注册
-  `harness.handle('sidor-chara/preset-install'|'preset-remove'|'preset-list')`，
-  客户端 `host.call` 完成 `copy('standard', id)` → 读文件 → 改写 persona 行 → 写回
-  （宿主 fs 写 `~/.dsh` 需授权，与安装脚本同性质）；可选 `recompose` 把当前空会话
-  直接换到该预设；
-- **静态形态（主路径）**：客户端经 `session.prompt` 委托当前 agent 执行（越界写文件
-  弹授权）：复制 standard 预设目录 → 改写 persona 行 → 写 preset.yml → 汇报；
-  `agentPresets` 热发现，用户随即可在官方「设置 → Agent 预设」与新建会话选择器选用。
+**执行者**：
 
-**卸载** = `agentPresets.remove(id)`（动态）/ 委托 agent 删除目录（静态）。
+- **静态形态（主路径）**：客户端经官方 `/api/session/prompt` 委托当前 agent 执行（越界写文件弹授权）——
+  下发的指令**同时给出 A/B 两套步骤与落点**，由 agent 按实际环境择一执行并回报采用的形态；
+- **动态形态（增强，当前未使用）**：host 半可 `inject: ['agentPresets']` 并用 `harness.handle` 暴露
+  `sidor-chara/preset-*`，但 0.2.0 起注册表无写入接口，该路径只在 0.1.5- 环境有效。
+
+**卸载**：A 形态删除 profile 补丁中 `preset-<id>` 的 insert 块；B 形态删除对应目录。
+同一时间只保留一个人设预设（安装时自动移除其他已装预设）。
 
 ### 4.4 设置页 UI 布局（占位栏 → v1）
 
@@ -206,8 +241,9 @@ sidPromptAgent(
 | 项 | 说明 |
 |---|---|
 | 通道 A 强度 | 消息级指令，模型遵循度非 100%；新会话需重新应用（二期可加「会话打开自动应用」绑定） |
-| 通道 B 体积 | 每张卡 = 一份完整预设（复制 standard），体积较大；换卡需新会话（`recompose` 仅限未产出内容的会话） |
-| 写 `~/.dsh` 授权 | 安装预设会写入 `%USERPROFILE%\.dsh\.agent-presets\`，DSH 会弹授权（与安装脚本同性质），须如实提示用户 |
+| 通道 B 体积 | 每张卡 = 一份完整预设（A 形态为 profile 补丁里的一条 `preset-<id>` 行，内含整份 plugins 列表；B 形态为整份预设目录），体积较大；换卡需新会话（0.1.5 的 `recompose` 仅限未产出内容的会话） |
+| 写 `~/.dsh` 授权 | 安装预设会写入 `%USERPROFILE%\.dsh`——A 形态改 `profiles\<profile>\cordis.patch.yml`（须先备份、不得动其他插件条目），B 形态写 `.agent-presets\<id>\`；DSH 会弹授权（与安装脚本同性质），须如实提示用户 |
+| 0.2.0 重启要求 | A 形态的预设行在 DSH 启动时载入，安装后**必须重启 DSH** 才会出现在「设置 → Agent 预设」 |
 | token 成本 | 通道 A 的指令与安装指令进入会话历史，占用 token（与 Sidor_box agent 代执行同性质） |
 
 ---
